@@ -1,0 +1,194 @@
+// 강사 로그인 계정 설정 (원하시는 아이디/비번으로 수정 가능)
+const TEACHER_ID = "canb";
+const TEACHER_PW = "1234";
+const DRIVE_FOLDER_NAME = "캔비어학원_리딩녹음파일";
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.tryLock(15000);
+
+  try {
+    var payload = JSON.parse(e.postData.contents);
+    var action = payload.action;
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    // 시트 초기화 (학생명단, 녹음기록, 유닛지문)
+    var studentSheet = getOrCreateSheet(ss, "학생명단", ["학생이름", "생년월일6자리", "등록일"]);
+    var recordSheet  = getOrCreateSheet(ss, "녹음기록", ["기록ID", "학생이름", "생년월일6자리", "유닛", "녹음일시", "파일URL", "파일ID"]);
+    var scriptSheet  = getOrCreateSheet(ss, "유닛지문", ["항목키", "제목", "지문내용"]);
+
+    // 1. 강사 로그인 검증
+    if (action === "teacherLogin") {
+      if (payload.id === TEACHER_ID && payload.pw === TEACHER_PW) {
+        return jsonResponse({ status: "ok" });
+      }
+      return jsonResponse({ status: "error", message: "아이디 또는 비밀번호가 일치하지 않습니다." });
+    }
+
+    // 2. 학생 등록 (강사용)
+    if (action === "addStudent") {
+      var sName = String(payload.studentName).trim();
+      var sBirth = String(payload.birth6).trim();
+      if (!sName || sBirth.length !== 6) {
+        return jsonResponse({ status: "error", message: "이름과 생년월일 6자리를 정확히 입력하세요." });
+      }
+      var sData = studentSheet.getDataRange().getValues();
+      for (var i = 1; i < sData.length; i++) {
+        if (String(sData[i][0]).trim() === sName && String(sData[i][1]).trim() === sBirth) {
+          return jsonResponse({ status: "error", message: "이미 등록된 학생입니다." });
+        }
+      }
+      studentSheet.appendRow([sName, sBirth, Utilities.formatDate(new Date(), "Asia/Seoul", "yyyy-MM-dd")]);
+      return jsonResponse({ status: "ok" });
+    }
+
+    // 3. 학생/학부모 로그인 및 기록 조회
+    if (action === "studentLogin") {
+      var name = String(payload.studentName).trim();
+      var birth = String(payload.birth6).trim();
+      var students = studentSheet.getDataRange().getValues();
+      var found = false;
+      for (var i = 1; i < students.length; i++) {
+        if (String(students[i][0]).trim() === name && String(students[i][1]).trim() === birth) {
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        return jsonResponse({ status: "error", message: "등록되지 않은 학생이거나 생년월일 6자리가 틀립니다." });
+      }
+
+      var records = getStudentRecords(recordSheet, name, birth);
+      var scripts = getUnitScripts(scriptSheet);
+      return jsonResponse({ status: "ok", records: records, scripts: scripts });
+    }
+
+    // 4. 오디오 파일 구글 드라이브 업로드 및 기록 저장
+    if (action === "uploadAudio") {
+      var uName = String(payload.studentName).trim();
+      var uBirth = String(payload.birth6).trim();
+      var unit = payload.unit;
+      var base64Data = payload.audioBase64;
+      var mimeType = payload.mimeType || "audio/webm";
+      var ext = mimeType.indexOf("mp4") !== -1 ? "m4a" : "webm";
+
+      var folder = getOrCreateDriveFolder(DRIVE_FOLDER_NAME);
+      var timestamp = Utilities.formatDate(new Date(), "Asia/Seoul", "yyyy-MM-dd HH:mm");
+      var safeUnitName = String(unit).replace(/[^a-zA-Z0-9가-힣_-]/g, "_");
+      var fileName = uName + "_" + safeUnitName + "_" + Utilities.formatDate(new Date(), "Asia/Seoul", "yyyyMMdd_HHmmss") + "." + ext;
+
+      var decoded = Utilities.base64Decode(base64Data);
+      var blob = Utilities.newBlob(decoded, mimeType, fileName);
+      var file = folder.createFile(blob);
+      file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+      var fileId = file.getId();
+      var directAudioUrl = "https://docs.google.com/uc?export=open&id=" + fileId;
+      var recordId = "REC_" + new Date().getTime();
+
+      recordSheet.appendRow([recordId, uName, uBirth, unit, timestamp, directAudioUrl, fileId]);
+
+      var updatedRecords = getStudentRecords(recordSheet, uName, uBirth);
+      return jsonResponse({ status: "ok", records: updatedRecords });
+    }
+
+    // 5. 강사용 전체 데이터 조회
+    if (action === "getAllTeacherData") {
+      if (payload.id !== TEACHER_ID || payload.pw !== TEACHER_PW) {
+        return jsonResponse({ status: "error", message: "인증 실패" });
+      }
+      var sList = [];
+      var sRows = studentSheet.getDataRange().getValues();
+      for (var i = 1; i < sRows.length; i++) {
+        sList.push({ name: sRows[i][0], birth: String(sRows[i][1]), regDate: sRows[i][2] });
+      }
+
+      var rList = [];
+      var rRows = recordSheet.getDataRange().getValues();
+      for (var j = rRows.length - 1; j >= 1; j--) {
+        rList.push({
+          recordId: rRows[j][0],
+          studentName: rRows[j][1],
+          birth: String(rRows[j][2]),
+          unit: rRows[j][3],
+          date: rRows[j][4],
+          audioUrl: rRows[j][5]
+        });
+      }
+      return jsonResponse({ status: "ok", students: sList, records: rList, scripts: getUnitScripts(scriptSheet) });
+    }
+
+    // 6. 리딩 & 뮤지컬 지문 저장 (강사용)
+    if (action === "saveUnitScript") {
+      if (payload.id !== TEACHER_ID || payload.pw !== TEACHER_PW) {
+        return jsonResponse({ status: "error", message: "인증 실패" });
+      }
+      var itemKey = String(payload.itemKey);
+      var rows = scriptSheet.getDataRange().getValues();
+      var updated = false;
+      for (var i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === itemKey) {
+          scriptSheet.getRange(i + 1, 2).setValue(payload.title);
+          scriptSheet.getRange(i + 1, 3).setValue(payload.content);
+          updated = true;
+          break;
+        }
+      }
+      if (!updated) {
+        scriptSheet.appendRow([itemKey, payload.title, payload.content]);
+      }
+      return jsonResponse({ status: "ok" });
+    }
+
+    return jsonResponse({ status: "error", message: "알 수 없는 요청입니다." });
+  } catch (err) {
+    return jsonResponse({ status: "error", message: err.toString() });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function getStudentRecords(sheet, name, birth) {
+  var rows = sheet.getDataRange().getValues();
+  var list = [];
+  for (var i = rows.length - 1; i >= 1; i--) {
+    if (String(rows[i][1]).trim() === name && String(rows[i][2]).trim() === birth) {
+      list.push({
+        recordId: rows[i][0],
+        unit: rows[i][3],
+        date: rows[i][4],
+        audioUrl: rows[i][5]
+      });
+    }
+  }
+  return list;
+}
+
+function getUnitScripts(sheet) {
+  var rows = sheet.getDataRange().getValues();
+  var map = {};
+  for (var i = 1; i < rows.length; i++) {
+    map[String(rows[i][0])] = { title: rows[i][1], content: rows[i][2] };
+  }
+  return map;
+}
+
+function getOrCreateSheet(ss, name, headers) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(headers);
+    sheet.getRange(1, 1, 1, headers.length).setBackground("#1e3a8a").setFontColor("#ffffff").setFontWeight("bold");
+  }
+  return sheet;
+}
+
+function getOrCreateDriveFolder(folderName) {
+  var folders = DriveApp.getFoldersByName(folderName);
+  if (folders.hasNext()) return folders.next();
+  return DriveApp.createFolder(folderName);
+}
+
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
